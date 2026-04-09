@@ -10,3 +10,6 @@ out*
 *.log
 data.jsonl
 results
+data/**
+!data/
+!data/questions.jsonl

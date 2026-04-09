@@ -28,8 +28,8 @@ import numpy as np
 import json
 from .memory_processing import parse_video_caption
 
-processing_config = json.load(open("configs/processing_config.json"))
-MAX_RETRIES = processing_config["max_retries"]
+from mmagent import processing_config
+MAX_RETRIES = 20
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ class VideoGraph:
         """
         self.nodes = {}  # node_id -> node object
         self.edges = {}  # (node_id1, node_id2) -> edge weight
+        self.adj = {}    # node_id -> set of neighbor node_ids for O(degree) lookup
         # Maintain ordered text nodes
         self.text_nodes = []  # List of text node IDs in insertion order
         
@@ -59,6 +60,27 @@ class VideoGraph:
         self.audio_matching_threshold = audio_matching_threshold
         
         self.next_node_id = 0
+        self.main_character = None
+        self.character_mappings = {}
+        self.reverse_character_mappings = {}
+
+    def _ensure_adj(self):
+        """Backward compatibility: ensure self.adj and mappings exist and are populated."""
+        if not hasattr(self, 'adj') or self.adj is None:
+            self.adj = {node_id: set() for node_id in self.nodes}
+            for (n1, n2) in self.edges:
+                if n1 in self.adj: self.adj[n1].add(n2)
+                if n2 in self.adj: self.adj[n2].add(n1)
+        if not hasattr(self, 'character_mappings') or self.character_mappings is None:
+            self.character_mappings = {}
+        if not hasattr(self, 'reverse_character_mappings') or self.reverse_character_mappings is None:
+            self.reverse_character_mappings = {}
+
+    def set_main_character(self, main_character):
+        self.main_character = main_character
+    
+    def get_main_character(self):
+        return self.main_character
 
     class Node:
         def __init__(self, node_id, node_type):
@@ -115,12 +137,23 @@ class VideoGraph:
 
     # Modification functions
     
+    def add_character_node(self, character_name):
+        self._ensure_adj()
+        if character_name not in self.nodes:
+            node = self.Node(character_name, 'character')
+            self.nodes[character_name] = node
+            if character_name not in self.adj:
+                self.adj[character_name] = set()
+            logger.debug(f"Character node added with ID {character_name}")
+        return character_name
+
     def add_img_node(self, imgs):
         """Add a new face node with initial image embedding(s).
         
         Args:
             img_embedding: Single embedding or list of embeddings
         """
+        self._ensure_adj()
         node = self.Node(self.next_node_id, 'img')
         
         img_embeddings = imgs['embeddings']
@@ -129,6 +162,7 @@ class VideoGraph:
         node.metadata['contents'] = imgs['contents']
         
         self.nodes[self.next_node_id] = node
+        self.adj[self.next_node_id] = set()
         self.next_node_id += 1
 
         logger.debug(f"Image node added with ID {node.id}")
@@ -141,6 +175,7 @@ class VideoGraph:
         Args:
             audio_embedding: Single embedding or list of embeddings
         """
+        self._ensure_adj()
         node = self.Node(self.next_node_id, 'voice')
         
         audio_embeddings = audios['embeddings']
@@ -149,6 +184,7 @@ class VideoGraph:
         node.metadata['contents'] = audios['contents']
         
         self.nodes[self.next_node_id] = node
+        self.adj[self.next_node_id] = set()
         self.next_node_id += 1
 
         logger.debug(f"Voice node added with ID {node.id}")
@@ -162,6 +198,7 @@ class VideoGraph:
             text: Text content
             text_type: Type of text node ('episodic' or 'semantic')
         """
+        self._ensure_adj()
         if text_type not in ['episodic', 'semantic']:
             raise ValueError("text_type must be either 'episodic' or 'semantic'")
 
@@ -171,6 +208,7 @@ class VideoGraph:
         node.metadata['timestamp'] = clip_id
         
         self.nodes[self.next_node_id] = node
+        self.adj[self.next_node_id] = set()
         self.text_nodes.append(node.id)  # Add to ordered list
         if clip_id not in self.text_nodes_by_clip:
             self.text_nodes_by_clip[clip_id] = []
@@ -228,16 +266,25 @@ class VideoGraph:
     def add_edge(self, node_id1, node_id2, weight=1.0):
         """Add or update bidirectional weighted edges between two nodes.
         Text-to-text connections are not allowed between same type text nodes."""
+        self._ensure_adj()
         if (node_id1 in self.nodes and node_id2 in self.nodes and not (self.nodes[node_id1].type == self.nodes[node_id2].type and self.nodes[node_id1].type in ['episodic', 'semantic'])):
             # Add both directions with same weight
             self.edges[(node_id1, node_id2)] = weight
             self.edges[(node_id2, node_id1)] = weight
+            
+            # Maintain adjacency list
+            if node_id1 not in self.adj: self.adj[node_id1] = set()
+            if node_id2 not in self.adj: self.adj[node_id2] = set()
+            self.adj[node_id1].add(node_id2)
+            self.adj[node_id2].add(node_id1)
+            
             logger.debug(f"Edge added between {node_id1} and {node_id2}")
             return True
         return False
 
     def update_edge_weight(self, node_id1, node_id2, delta_weight):
         """Update weight of existing bidirectional edge."""
+        self._ensure_adj()
         if (node_id1, node_id2) in self.edges:
             # Update both directions
             self.edges[(node_id1, node_id2)] += delta_weight
@@ -246,6 +293,11 @@ class VideoGraph:
             if self.edges[(node_id1, node_id2)] <= 0:
                 del self.edges[(node_id1, node_id2)]
                 del self.edges[(node_id2, node_id1)]
+                
+                # Update adjacency list
+                if node_id1 in self.adj: self.adj[node_id1].discard(node_id2)
+                if node_id2 in self.adj: self.adj[node_id2].discard(node_id1)
+                
                 logger.debug(f"Edge removed between {node_id1} and {node_id2}")
             return True
         return False
@@ -260,14 +312,15 @@ class VideoGraph:
         Returns:
             int: Number of edges reinforced
         """
-        if node_id not in self.nodes:
+        self._ensure_adj()
+        if node_id not in self.nodes or node_id not in self.adj:
             return 0
             
         reinforced_count = 0
-        for (n1, n2) in list(self.edges.keys()):  # Create a list to avoid modification during iteration
-            if n1 == node_id or n2 == node_id:
-                self.update_edge_weight(n1, n2, delta_weight)
-                reinforced_count += 1
+        neighbors = list(self.adj[node_id])
+        for neighbor in neighbors:
+            self.update_edge_weight(node_id, neighbor, delta_weight)
+            reinforced_count += 1
 
         logger.debug(f"{reinforced_count} edges reinforced for node {node_id}")
                 
@@ -283,14 +336,15 @@ class VideoGraph:
         Returns:
             int: Number of edges weakened
         """
-        if node_id not in self.nodes:
+        self._ensure_adj()
+        if node_id not in self.nodes or node_id not in self.adj:
             return 0
             
         weakened_count = 0
-        for (n1, n2) in list(self.edges.keys()):  # Create a list to avoid modification during iteration
-            if n1 == node_id or n2 == node_id:
-                self.update_edge_weight(n1, n2, -delta_weight)  # Use negative delta_weight to decrease
-                weakened_count += 1
+        neighbors = list(self.adj[node_id])
+        for neighbor in neighbors:
+            self.update_edge_weight(node_id, neighbor, -delta_weight)
+            weakened_count += 1
 
         logger.debug(f"{weakened_count} edges weakened for node {node_id}")
                 
@@ -542,14 +596,13 @@ class VideoGraph:
     # Retrieval functions
 
     def get_connected_nodes(self, node_id, type=['img', 'voice', 'episodic', 'semantic']):
-        """Get all nodes connected to given node."""
-        connected = set()  # Use set to avoid duplicates due to bidirectional edges
-        for (n1, n2), _ in self.edges.items():
-            if n1 == node_id and self.nodes[n2].type in type:
-                connected.add(n2)
-            elif n2 == node_id and self.nodes[n1].type in type:
-                connected.add(n1)
-        return list(set(connected))
+        """Get all nodes connected to given node using adjacency list for O(degree) lookup."""
+        self._ensure_adj()
+        if node_id not in self.adj:
+            return []
+        
+        connected = [nid for nid in self.adj[node_id] if nid in self.nodes and self.nodes[nid].type in type]
+        return connected
 
     def search_text_nodes(self, query_embeddings, range_nodes=[], mode="max"):
         """Search for text nodes using text embeddings.
@@ -867,6 +920,7 @@ class VideoGraph:
         # truncate the memory by clip_id
         # remove all nodes that are after the clip_id
         # return the truncated memory
+        self._ensure_adj()
         
         # find the last node with clip_id
         last_node_id = None
@@ -882,6 +936,8 @@ class VideoGraph:
                 to_del.append(node_id)
         for node_id in to_del:
             del self.nodes[node_id]
+            if node_id in self.adj:
+                del self.adj[node_id]
         # remove all edges that are after the last_node_id
         to_del = []
         for edge in self.edges.keys():
@@ -889,6 +945,9 @@ class VideoGraph:
                 to_del.append(edge)
         for edge in to_del:
             del self.edges[edge]
+            # Update adjacency list
+            if edge[0] in self.adj: self.adj[edge[0]].discard(edge[1])
+            if edge[1] in self.adj: self.adj[edge[1]].discard(edge[0])
         # remove all text nodes that are after the last_node_id
         to_del = []
         for node_id in self.text_nodes:
@@ -916,12 +975,15 @@ class VideoGraph:
         return
     
     def prune_memory_by_node_type(self, node_type='semantic'):
+        self._ensure_adj()
         del_nodes = []
         for node_id, node in self.nodes.items():
             if node.type == node_type:
                 del_nodes.append(node_id)
         for node_id in del_nodes:
             del self.nodes[node_id]
+            if node_id in self.adj:
+                del self.adj[node_id]
         # update the edges
         to_del = []
         for edge in self.edges.keys():
@@ -929,6 +991,9 @@ class VideoGraph:
                 to_del.append(edge)
         for edge in to_del:
             del self.edges[edge]
+            # Update adjacency list
+            if edge[0] in self.adj: self.adj[edge[0]].discard(edge[1])
+            if edge[1] in self.adj: self.adj[edge[1]].discard(edge[0])
         # update the text_nodes
         to_del = []
         for node_id in self.text_nodes:

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run full pipeline per video. Videos can be processed in parallel.
+# 1) Download video frames from HF
+# 2) Build graph memory
+# 3) Answer questions with control.py
+# 4) Cleanup frames
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+# Number of videos to process in parallel (set to 1 for sequential)
+MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
+
+cleanup_video() {
+  local video_name="$1"
+  rm -rf "data/frames/${video_name}"
+}
+
+process_one_video() {
+  local video="$1"
+  [[ -z "$video" ]] && return 0
+
+  echo ""
+  echo "[$(date +%H:%M:%S)] Processing video: ${video}"
+  echo "============================================================"
+
+  # Step 1: Download video frames from Hugging Face
+  if ! python3 download_hf_frames.py "$video"; then
+    echo "✗ [${video}] Download failed"
+    cleanup_video "$video"
+    return 1
+  fi
+
+  # Step 2: Build graph memory
+  if python3 -m m3_agent.memorization_memory_graphs --video_names "$video"; then
+    echo "✓ [${video}] Graph memory built"
+  else
+    echo "✗ [${video}] Graph memory building failed"
+    cleanup_video "$video"
+    return 1
+  fi
+
+  # Step 3: Answer questions with control.py
+  if python3 -m m3_agent.control --video_names "$video"; then
+    echo "✓ [${video}] Reasoning complete"
+  else
+    echo "✗ [${video}] Reasoning failed"
+    cleanup_video "$video"
+    return 1
+  fi
+
+  # Step 4: Cleanup to free storage
+  cleanup_video "$video"
+  echo "✓ [${video}] Done (cleaned up)"
+  return 0
+}
+
+if [[ "$#" -gt 0 ]]; then
+  VIDEOS=("$@")
+else
+  if [[ ! -f "video_list.txt" ]]; then
+    echo "video_list.txt not found. Pass video names as arguments."
+    exit 1
+  fi
+  mapfile -t VIDEOS < "video_list.txt"
+fi
+
+echo "Processing ${#VIDEOS[@]} videos with max ${MAX_PARALLEL_JOBS} parallel jobs"
+echo ""
+
+# Process in batches to avoid race conditions and limit concurrency
+i=0
+while (( i < ${#VIDEOS[@]} )); do
+  batch=()
+  for ((j=0; j < MAX_PARALLEL_JOBS && i < ${#VIDEOS[@]}; j++)); do
+    video="${VIDEOS[i]}"
+    if [[ -n "$video" ]]; then
+      batch+=("$video")
+    fi
+    (( i++ )) || true
+  done
+  if [[ ${#batch[@]} -gt 0 ]]; then
+    for video in "${batch[@]}"; do
+      ( process_one_video "$video" ) &
+    done
+    wait || true  # Continue to merge even if some jobs failed
+  fi
+done
+echo ""
+echo "All video processing complete."
+
+echo ""
+echo "Pipeline complete."

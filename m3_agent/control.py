@@ -16,98 +16,45 @@ import os
 import sys
 import json
 import time
-import openai
 import argparse
-import multiprocessing
 import mmagent.videograph
 from mmagent.retrieve import search
-from vllm import LLM, SamplingParams
-from transformers import AutoTokenizer
-from mmagent.utils.general import load_video_graph
-from mmagent.utils.chat_api import generate_messages
-from mmagent.prompts import prompt_agent_verify_answer_referencing
+from mmagent.general import load_video_graph
+from mmagent.mllm_gpt import generate_messages
+from mmagent.prompts import prompt_agent_verify_answer_referencing, prompt_generate_action_with_plan_structured
+from mmagent.llm import generate_text_response
+from mmagent.output_structure import ActionOutput
 
 sys.modules["videograph"] = mmagent.videograph
-processing_config = json.load(open("configs/processing_config.json"))
-model_name = "models/M3-Agent-Control"
-config = json.load(open("configs/api_config.json"))
-gpt_model = "gpt-4o-2024-11-20"
-client = openai.AzureOpenAI(
-    azure_endpoint=config[gpt_model]["azure_endpoint"],
-    api_version=config[gpt_model]["api_version"],
-    api_key=config[gpt_model]["api_key"],
-)
 
-def get_response(messages, timeout=30):
-    response = client.chat.completions.create(
-        model=gpt_model, messages=messages, temperature=0, timeout=timeout, max_tokens=2048
-    )
-    return response.choices[0].message.content, response.usage.total_tokens
-
-def get_response_with_retry(messages, timeout=30):
-    for i in range(20):
-        try:
-            return get_response(messages, timeout)
-        except Exception as e:
-            time.sleep(20)
-            print(f"Retry {i} times, exception: {e} from message {messages}")
-            continue
-    raise Exception(f"Failed to get response after 5 retries")
+# Hardcoded defaults
+processing_config = {
+    "logging": "INFO",
+    "model": "gpt-5-mini",
+    "batch_size": 64,
+    "total_round": 5,
+    "topk": 50
+}
 
 def eval_answer(question, predict, ground_truth):
     if predict == "":
-        return False
+        return False, 0
     try:
-        input = [
-            {
-                "type": "text",
-                "content": prompt_agent_verify_answer_referencing.format(
-                    question=question,
-                    ground_truth_answer=ground_truth,
-                    agent_answer=predict,
-                ),
-            }   
-        ]
-        messages = generate_messages(input)
-        response = get_response_with_retry(messages)
-        result = response[0].lower()
+        prompt = f"Question: {question}\nGround Truth: {ground_truth}\nAgent Answer: {predict}\n\n{prompt_agent_verify_answer_referencing}"
+        res, tokens = generate_text_response(prompt)
+        result = res.lower()
     except Exception as e:
         print(f"Error verifying qa: {question} | {str(e)}")
-        return False
-    return True if "yes" in result else False
+        return False, 0
+    return (True if "yes" in result else False), tokens
 
-system_prompt = "You are given a question and some relevant knowledge. Your task is to reason about whether the provided knowledge is sufficient to answer the question. If it is sufficient, output [Answer] followed by the answer. If it is not sufficient, output [Search] and generate a query that will be encoded into embeddings for a vector similarity search. The query will help retrieve additional information from a memory bank.\n\nQuestion: {question}"
-instruction = f"""
-
-Output the answer in the format:
-Action: [Answer] or [Search]
-Content: {{content}}
-
-If the answer cannot be derived yet, the {{content}} should be a single search query that would help retrieve the missing information. The search {{content}} needs to be different from the previous.
-You can get the mapping relationship between character ID and name by using search query such as: "What is the name of <character_{{i}}>" or "What is the character id of {{name}}".
-After obtaining the mapping, it is best to use character ID instead of name for searching.
-If the answer can be derived from the provided knowledge, the {{content}} is the specific answer to the question. Only name can appear in the answer, not character ID like <character_{{i}}>."""
-
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-sampling_params = SamplingParams(
-    temperature=0.6,
-    top_p=0.95,
-    top_k=20,
-    max_tokens=1024
-)
-pattern = r"Action: \[(.*)\].*Content: (.*)"
-
-def consumer(data):
+def process_action(data, response_json):
     if not data["finish"]:
         before_clip = data.get("before_clip", None)
-        response = data["conversations"][-1]["content"]
-        match_result = re.search(pattern, response.split("</think>")[-1], re.DOTALL)
-        if match_result:
-            action = match_result.group(1)
-            content = match_result.group(2)
-        else:
-            action = "Search"
-            content = None
+        
+        action = response_json.action
+        content = response_json.content
+        
         if action == "Answer":
             data["response"] = content
             data["finish"] = True
@@ -115,18 +62,21 @@ def consumer(data):
             new_memories = {}
             if content:
                 mem_node = load_video_graph(data["mem_path"])
-                if before_clip is not None:
-                    mem_node.truncate_memory_by_clip(before_clip, False)
-                mem_node.refresh_equivalences()
-                if "character id" in content:
-                    memories, _, _ = search(mem_node, content, [], mem_wise=True, topk=20, before_clip=before_clip)
-                    new_memories.update(memories)
+                if mem_node is None:
+                    search_result = f"Error: Memory graph not found at {data['mem_path']}"
                 else:
-                    memories, currenr_clips, _ = search(mem_node, content, data["currenr_clips"], threshold=0.5, topk=processing_config["topk"], before_clip=before_clip)
+                    if before_clip is not None:
+                        if hasattr(mem_node, 'truncate_memory_by_clip'):
+                            mem_node.truncate_memory_by_clip(before_clip, False)
+                    
+                    memories, currenr_clips, _ = search(mem_node, content, data["currenr_clips"], threshold=0.2, topk=processing_config["topk"], before_clip=before_clip)
                     data["currenr_clips"] = currenr_clips
                     new_memories.update(memories)
-            search_result = "Searched knowledge: " + json.dumps(new_memories, ensure_ascii=False).encode("utf-8", "ignore").decode("utf-8")
-            if len(new_memories) == 0:
+                    search_result = "Searched knowledge: " + json.dumps(new_memories, ensure_ascii=False).encode("utf-8", "ignore").decode("utf-8")
+            else:
+                search_result = "Searched knowledge: {}"
+                
+            if len(new_memories) == 0 and content:
                 search_result += "\n(The search result is empty. Please try searching from another perspective.)"
             data["conversations"].append({"role": "user", "content": search_result})
     return data
@@ -134,78 +84,126 @@ def consumer(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_file", type=str, default="data/annotations/robot.json")
+    parser.add_argument("--video_names", type=str, nargs='+', help="Specific video names to process")
+    parser.add_argument("--questions_file", type=str, default="data/questions.jsonl")
+    parser.add_argument("--mem_dir", type=str, default="data/graphs")
+    parser.add_argument("--output_dir", type=str, default="data/results")
     args = parser.parse_args()
-    dataset_name = args.data_file.split("/")[-1].split(".")[0]
-    output_path = os.path.join("data/results", f"{dataset_name}.jsonl")
-    model = LLM(model=model_name, tensor_parallel_size=2)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    batched_datas, data = [], []
-    datas = json.load(open(args.data_file))
-    for _, v in datas.items():
-        for qa in v["qa_list"]:
-            data.append({
-                "id": qa["question_id"],
-                "mem_path": v["mem_path"],
-                "question": qa["question"],
-                "answer": qa["answer"],
-            })
-            if "before_clip" in qa:
-                data[-1]["before_clip"] = qa["before_clip"]
-            if len(data) == processing_config["batch_size"]:
-                batched_datas.append(data)
-                data = []
-    if len(data) > 0:
-        batched_datas.append(data)
+    # Load all questions
+    questions_data = {}
+    if os.path.exists(args.questions_file):
+        with open(args.questions_file, "r") as f:
+            for line in f:
+                if not line.strip(): continue
+                item = json.loads(line)
+                vid = item.get("video_id")
+                if vid not in questions_data:
+                    questions_data[vid] = []
+                questions_data[vid].append(item)
+    else:
+        print(f"Questions file {args.questions_file} not found")
+        sys.exit(1)
 
-    result = []
-    for batched_data in batched_datas:
-        for i in range(len(batched_data)):
-            batched_data[i]["conversations"] = [{"role": "system", "content": system_prompt.format(question=batched_data[i]["question"])}, {"role": "user", "content": "Searched knowledge: {}"}]
-            batched_data[i]["finish"] = False
-            batched_data[i]["currenr_clips"] = []
+    if args.video_names:
+        videos_to_process = args.video_names
+    else:
+        videos_to_process = sorted(questions_data.keys())
 
-        for idx in range(processing_config["total_round"]):
-            vllm_inputs = []
-            for data in batched_data:
-                if data["finish"]:
-                    continue
-                data["conversations"][-1]["content"] += instruction
-                if idx == processing_config["total_round"] - 1:
-                    data["conversations"][-1]["content"] += "\n(The Action of this round must be [Answer]. If there is insufficient information, you can make reasonable guesses.)"
-                text = tokenizer.apply_chat_template(
-                    data["conversations"],
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    enable_thinking=True
-                )
-                vllm_inputs.append({"prompt_token_ids": text})
+    videos_to_process = videos_to_process[:2]
 
-            outputs = model.generate(
-                prompts=vllm_inputs,
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
+    for video_name in videos_to_process:
+        print(f"================ processing video: {video_name} ================")
+        video_questions = questions_data.get(video_name, [])
+        if not video_questions:
+            print(f"No questions found for video {video_name}")
+            continue
 
-            i = 0
-            for data in batched_data:
-                if data["finish"]:
-                    continue
-                data["conversations"].append({"role": "assistant", "content": outputs[i].outputs[0].text})
-                i += 1
-            assert i == len(vllm_inputs)
+        output_path = os.path.join(args.output_dir, f"{video_name}.jsonl")
+        mem_path = os.path.join(args.mem_dir, f"{video_name}.pkl")
+
+        # Clear old results for this video
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        video_total_tokens = 0
+        for q_idx, qa in enumerate(video_questions):
+            data = {
+                "id": qa.get("question_id") if qa.get("question_id") is not None else f"{video_name}_{q_idx}",
+                "mem_path": mem_path,
+                "question": qa.get("question_text", qa.get("question")),
+                "answer": qa.get("correct_answer", qa.get("answer")),
+                "before_clip": qa.get("timestamp")
+            }
             
-            with multiprocessing.Pool() as pool:
-                batched_data = pool.map(consumer, batched_data)
+            data["conversations"] = [
+                {"role": "user", "content": "Searched knowledge: {}"}
+            ]
+            data["finish"] = False
+            data["currenr_clips"] = []
+            data["token_consumption"] = 0
 
-        for data in batched_data:
+            for idx in range(processing_config["total_round"]):
+                if data["finish"]:
+                    break
+                
+                knowledge_str = ""
+                for msg in data["conversations"]:
+                    if msg['role'] == 'user':
+                        knowledge_str += f"{msg['content']}\n"
+                
+                final_round_hint = ""
+                if idx == processing_config["total_round"] - 1:
+                    final_round_hint = "\n(This is the final round. You MUST choose 'Answer'.)"
+                
+                prompt = prompt_generate_action_with_plan_structured.format(
+                    question=data["question"],
+                    knowledge=knowledge_str + final_round_hint
+                )
+                
+                try:
+                    response_json, tokens = generate_text_response(prompt, text_format=ActionOutput)
+                    data["token_consumption"] += tokens
+                except Exception as e:
+                    print(f"Error calling LLM: {e}")
+                    # Fallback
+                    response_json = ActionOutput(reasoning="Error", action="Answer", content="Error occurred during LLM call.")
+                
+                data["conversations"].append({"role": "assistant", "content": f"Reasoning: {response_json.reasoning}\nAction: {response_json.action}\nContent: {response_json.content}"})
+                data = process_action(data, response_json)
+
+            # Evaluate the final answer
             if "response" in data:
-                data["gpt_eval"] = eval_answer(data["question"], data["response"], data["answer"])
-                time.sleep(0.5)
+                eval_res, eval_tokens = eval_answer(data["question"], data["response"], data["answer"])
+                data["gpt_eval"] = eval_res
+                data["token_consumption"] += eval_tokens
             else:
                 data["gpt_eval"] = False
-            result.append(json.dumps(data, ensure_ascii=False) + '\n')
+            
+            video_total_tokens += data["token_consumption"]
+            with open(output_path, "a") as f:
+                f.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+            print(f"Processed question {data['id']} for video {video_name}")
 
-    with open(output_path, "w") as f:
-        for i in result:
-            f.write(i)
+        # Save aggregated token consumption for the video
+        control_tokens_dir = "data/control_tokens"
+        os.makedirs(control_tokens_dir, exist_ok=True)
+        video_token_summary = {"total": video_total_tokens}
+        with open(os.path.join(control_tokens_dir, f"{video_name}.json"), "w") as f:
+            json.dump({"control_token_summaries": video_token_summary}, f, indent=2)
+        
+        # Update aggregated control tokens file
+        agg_control_tokens_path = "data/control_tokens.json"
+        agg_control_tokens = {}
+        if os.path.exists(agg_control_tokens_path):
+            try:
+                with open(agg_control_tokens_path, "r") as f:
+                    agg_control_tokens = json.load(f)
+            except:
+                pass
+        agg_control_tokens[video_name] = video_token_summary
+        with open(agg_control_tokens_path, "w") as f:
+            json.dump(agg_control_tokens, f, indent=2)
+        print(f"Saved control token consumption for {video_name}")
