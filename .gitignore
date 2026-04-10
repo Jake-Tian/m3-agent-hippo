@@ -6,7 +6,8 @@ idl
 speakerlab
 models
 logs
-out*
+# Avoid out* — it ignored mmagent/output_structure.py. Use explicit dirs if needed.
+out/
 *.log
 data.jsonl
 results
